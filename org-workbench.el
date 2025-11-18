@@ -5,7 +5,7 @@
 ;; Author: Yibie <yibie@outlook.com>
 ;; Maintainer: Yibie <yibie@outlook.com>
 ;; URL: https://github.com/yibie/org-workbench
-;; Version: 0.1.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1") (org "9.6"))
 ;; Keywords: org-mode, workbench, card-system, note-taking
 
@@ -28,6 +28,19 @@
 ;; This package provides a digital card workbench system for org-mode.
 ;; It allows you to create, organize, and manage cards from your org-mode notes.
 ;; Perfect for research organization, writing projects, and argument structure building.
+;;
+;; Supports both heading-level cards and file-level cards:
+;; - Heading cards: Extract individual org headings as cards
+;; - File cards: Treat entire org files as single cards
+;;
+;; Main Commands:
+;; - org-workbench-add-subtree: Add all headings in subtree
+;; - org-workbench-add-heading: Add single heading
+;; - org-workbench-add-file: Add entire file as card
+;; - org-workbench-manage: Manage workbenches
+;; - org-workbench-show: Display workbench
+;;
+;; No default key bindings are set. See README.md for suggested bindings.
 
 ;;; Code:
 
@@ -72,18 +85,6 @@ When enabled, org-workbench will rely on org-mode's native ID system."
 
 
 ;;------------------------------------------------------------------------------
-;; Key Bindings
-;;------------------------------------------------------------------------------
-
-(defvar org-workbench-mode-map
-  (let ((map (make-sparse-keymap)))
-      (define-key map (kbd "C-c w a") 'org-workbench-add-subtree)
-      (define-key map (kbd "C-c w h") 'org-workbench-add-heading)
-      (define-key map (kbd "C-c w m") 'org-workbench-manage)
-    map)
-  "Keymap for org-workbench-mode.")
-
-;;------------------------------------------------------------------------------
 ;; Core Functions
 ;;------------------------------------------------------------------------------
 
@@ -99,6 +100,61 @@ When enabled, org-workbench will rely on org-mode's native ID system."
         (progn
           (org-id-get-create)
           (org-entry-get (point) "ID")))))
+
+;; File-level ID Functions
+(defun org-workbench--get-file-id ()
+  "Read #+ID: keyword from current file.
+Returns the ID string or nil if not found."
+  (save-excursion
+    (goto-char (point-min))
+    (when (re-search-forward "^#\\+ID:\\s-+\\(.+\\)$" nil t)
+      (string-trim (match-string 1)))))
+
+(defun org-workbench--create-file-id ()
+  "Create and insert #+ID: keyword at the top of current file.
+Returns the newly created ID string."
+  (let ((new-id (org-id-new)))
+    (save-excursion
+      (goto-char (point-min))
+      ;; Skip existing metadata lines to insert in proper position
+      (while (and (not (eobp))
+                  (looking-at "^#\\+\\(TITLE\\|AUTHOR\\|DATE\\|FILETAGS\\):"))
+        (forward-line 1))
+      ;; Insert ID after other metadata or at top
+      (insert (format "#+ID: %s\n" new-id))
+      new-id)))
+
+(defun org-workbench--get-or-create-file-id ()
+  "Get existing file ID or create a new one if ID system is enabled.
+Returns ID string or nil if ID system is disabled."
+  (when (org-workbench--should-use-id-p)
+    (or (org-workbench--get-file-id)
+        (org-workbench--create-file-id))))
+
+;; File Metadata Extraction Functions
+(defun org-workbench--get-file-title ()
+  "Extract #+TITLE: keyword from current file or use filename.
+Returns the title string."
+  (or (save-excursion
+        (goto-char (point-min))
+        (when (re-search-forward "^#\\+TITLE:\\s-+\\(.+\\)$" nil t)
+          (string-trim (match-string 1))))
+      (file-name-base (buffer-file-name))))
+
+(defun org-workbench--get-file-content ()
+  "Extract file content, skipping metadata block.
+Returns content string truncated to configured length."
+  (save-excursion
+    (goto-char (point-min))
+    ;; Skip all metadata lines (#+KEY: value)
+    (while (and (not (eobp))
+                (or (looking-at "^#\\+[A-Z_]+:")
+                    (looking-at "^[ \t]*$")))
+      (forward-line 1))
+    (let* ((content-start (point))
+           (content-end (point-max))
+           (content (buffer-substring-no-properties content-start content-end)))
+      (org-workbench--truncate-content content))))
 
 ;; Content Extraction Functions
 (defun org-workbench--get-heading-content-only ()
@@ -179,6 +235,22 @@ When enabled, org-workbench will rely on org-mode's native ID system."
           :number number
           :title title
           :content (org-workbench--truncate-content content)
+          :level level
+          :file file)))
+
+(defun org-workbench--extract-file-card-info ()
+  "Extract card information from current org file.
+Returns a card plist with :level 0 to indicate it's a file card."
+  (let* ((file (buffer-file-name))
+         (id (org-workbench--get-or-create-file-id))
+         (title (org-workbench--get-file-title))
+         (content (org-workbench--get-file-content))
+         (number nil)  ; Files typically don't have Luhmann numbers
+         (level 0))    ; level = 0 indicates file card
+    (list :id id
+          :number number
+          :title title
+          :content content
           :level level
           :file file)))
 
@@ -446,6 +518,47 @@ When enabled, org-workbench will rely on org-mode's native ID system."
             (when workbench-buffer
               (org-workbench-show)))))))))
 
+(defun org-workbench-add-file ()
+  "Add the current org file as a card to current workbench.
+The entire file is treated as a single card with level 0."
+  (interactive)
+  ;; Safety check: ensure we're in an org buffer
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Not in an org-mode buffer"))
+  
+  ;; Safety check: ensure buffer has a file
+  (unless (buffer-file-name)
+    (user-error "Buffer is not visiting a file"))
+  
+  (org-workbench--ensure-default-workbench)
+  (let* ((file (buffer-file-name))
+         (card-info (org-workbench--extract-file-card-info))
+         (current-cards (org-workbench--get-cards))
+         (card-id (plist-get card-info :id)))
+    
+    ;; Check if file already exists in workbench
+    ;; Use ID if available, otherwise use file path
+    (if (catch 'found
+          (dolist (card current-cards)
+            (when (if (and card-id (plist-get card :id))
+                      (equal (plist-get card :id) card-id)
+                    (and (zerop (or (plist-get card :level) 1))
+                         (string= (plist-get card :file) file)))
+              (throw 'found t)))
+          nil)
+        (message "File already in workbench: %s" (plist-get card-info :title))
+      ;; Add new file card
+      (org-workbench--set-cards (cons card-info current-cards))
+      (org-workbench--save)
+      (message "Added file: %s to workbench: %s" 
+               (plist-get card-info :title) 
+               org-workbench-current-workbench)
+      
+      ;; Automatically refresh workbench display
+      (let ((workbench-buffer (get-buffer org-workbench-buffer-name)))
+        (when workbench-buffer
+          (org-workbench-show))))))
+
 ;;------------------------------------------------------------------------------
 ;; Display Functions
 ;;------------------------------------------------------------------------------
@@ -482,14 +595,20 @@ When enabled, org-workbench will rely on org-mode's native ID system."
       ;; Render cards
       (let ((cards (org-workbench--get-cards)))
         (if (null cards)
-            (insert "Workbench is empty.\n\nM-x org-workbench-add-subtree/M-x org-workbench-add-heading to add cards.")
+            (insert "Workbench is empty.\n\nUse C-c w a/h/f to add cards.")
           (dolist (card cards)
             (let* ((start (point))
                    (title (plist-get card :title))
-                   (content (plist-get card :content)))
+                   (content (plist-get card :content))
+                   (level (plist-get card :level))
+                   (is-file-card (zerop (or level 1)))
+                   ;; Add [FILE] prefix for file cards
+                   (display-title (if is-file-card
+                                      (format "[FILE] %s" title)
+                                    title)))
               
-              ;; Force all cards to be displayed as top-level headings, regardless of their original level
-              (insert (format "* %s\n" title))
+              ;; Force all cards to be displayed as top-level headings
+              (insert (format "* %s\n" display-title))
               
               ;; Insert content
               (when (and content (not (string= content "")))
@@ -540,15 +659,6 @@ When enabled, org-workbench will rely on org-mode's native ID system."
   "Setup org-workbench."
   (org-workbench--load)
   (org-workbench--ensure-default-workbench))
-
-;;------------------------------------------------------------------------------
-;; Mode Definition
-;;------------------------------------------------------------------------------
-
-(define-minor-mode org-workbench-mode
-  "Minor mode for org-workbench."
-  :lighter " Workbench"
-  :keymap org-workbench-mode-map)
 
 ;;------------------------------------------------------------------------------
 ;; Card Operations
@@ -694,75 +804,134 @@ When enabled, org-workbench will rely on org-mode's native ID system."
 ;; ID-based Enhanced Functions
 ;;------------------------------------------------------------------------------
 
+(defun org-workbench--sync-file-card (card)
+  "Sync a file card by re-extracting its content from the source file.
+Returns the updated card plist or nil if sync failed."
+  (let ((file (plist-get card :file)))
+    (when (and file (file-exists-p file))
+      (save-excursion
+        (with-current-buffer (find-file-noselect file)
+          (org-workbench--extract-file-card-info))))))
+
 (defun org-workbench-goto-source ()
   "Jump to the source location of the current card.
-This function requires ID system to be enabled and the card to have an ID."
+For heading cards, this requires ID system to be enabled and the card to have an ID.
+For file cards, this opens the file directly."
   (interactive)
   (let* ((card (org-workbench-get-current-card))
-         (id (when card (plist-get card :id))))
-    (if (and id (org-workbench--should-use-id-p))
-        (progn
-          (org-id-goto id)
-          (message "Jumped to source: %s" (plist-get card :title)))
-      (if (not (org-workbench--should-use-id-p))
-          (user-error "ID system is not enabled. Enable org-workbench-enable-id-system and load a supported package (org-supertag, org-brain, or org-roam)")
-        (user-error "No card found at point or card has no ID")))))
+         (level (when card (plist-get card :level)))
+         (id (when card (plist-get card :id)))
+         (file (when card (plist-get card :file))))
+    (cond
+     ;; File card (level = 0)
+     ((and card (zerop (or level 1)))
+      (if file
+          (progn
+            (find-file file)
+            (message "Opened file: %s" (plist-get card :title)))
+        (user-error "File card has no file path")))
+     ;; Heading card (level > 0)
+     ((and id (org-workbench--should-use-id-p))
+      (org-id-goto id)
+      (message "Jumped to source: %s" (plist-get card :title)))
+     ;; Error cases
+     ((not (org-workbench--should-use-id-p))
+      (user-error "ID system is not enabled. Enable org-workbench-enable-id-system"))
+     (t
+      (user-error "No card found at point or card has no ID")))))
 
 (defun org-workbench-sync-card ()
   "Sync the content of the current card with its source.
-This function requires ID system to be enabled and the card to have an ID."
+For heading cards, ID system must be enabled.
+For file cards, syncs from the file directly."
   (interactive)
   (let* ((card (org-workbench-get-current-card))
-         (id (when card (plist-get card :id))))
-    (if (and id (org-workbench--should-use-id-p))
-        (progn
-          (message "Syncing card %s..." id)
-          ;; Get the latest data from the source node
-          (let* ((current-cards (org-workbench--get-cards))
-                 (card-index (catch 'found
-                               (let ((index 0))
-                                 (dolist (c current-cards)
-                                   (when (equal c card)
-                                     (throw 'found index))
-                                   (setq index (1+ index)))
-                                 nil)))
-                 (updated-card (when card-index
-                                (save-excursion
-                                  (org-id-goto id)
-                                  (org-workbench--extract-card-info nil)))))
-            (if updated-card
-                (progn
-                  ;; Replace the old card with the updated one
-                  (setf (nth card-index current-cards) updated-card)
-                  (org-workbench--set-cards current-cards)
-                  (org-workbench--save)
-                  (org-workbench-show)
-                  (message "Card synced successfully"))
-              (message "Failed to sync card: could not retrieve updated data")))
-      (if (not (org-workbench--should-use-id-p))
-          (user-error "ID system is not enabled. Enable org-workbench-enable-id-system and load a supported package (org-supertag, org-brain, or org-roam)")
-        (user-error "No card found at point or card has no ID"))))))
+         (level (when card (plist-get card :level)))
+         (id (when card (plist-get card :id)))
+         (is-file-card (and card (zerop (or level 1)))))
+    (cond
+     ;; File card - sync from file
+     (is-file-card
+      (let* ((current-cards (org-workbench--get-cards))
+             (card-index (catch 'found
+                           (let ((index 0))
+                             (dolist (c current-cards)
+                               (when (equal c card)
+                                 (throw 'found index))
+                               (setq index (1+ index)))
+                             nil)))
+             (updated-card (when card-index
+                            (org-workbench--sync-file-card card))))
+        (if updated-card
+            (progn
+              (setf (nth card-index current-cards) updated-card)
+              (org-workbench--set-cards current-cards)
+              (org-workbench--save)
+              (org-workbench-show)
+              (message "File card synced successfully"))
+          (message "Failed to sync file card"))))
+     
+     ;; Heading card - sync via ID
+     ((and id (org-workbench--should-use-id-p))
+      (message "Syncing card %s..." id)
+      (let* ((current-cards (org-workbench--get-cards))
+             (card-index (catch 'found
+                           (let ((index 0))
+                             (dolist (c current-cards)
+                               (when (equal c card)
+                                 (throw 'found index))
+                               (setq index (1+ index)))
+                             nil)))
+             (updated-card (when card-index
+                            (save-excursion
+                              (org-id-goto id)
+                              (org-workbench--extract-card-info nil)))))
+        (if updated-card
+            (progn
+              (setf (nth card-index current-cards) updated-card)
+              (org-workbench--set-cards current-cards)
+              (org-workbench--save)
+              (org-workbench-show)
+              (message "Card synced successfully"))
+          (message "Failed to sync card: could not retrieve updated data"))))
+     
+     ;; Error cases
+     ((not (org-workbench--should-use-id-p))
+      (user-error "ID system is not enabled. Enable org-workbench-enable-id-system"))
+     (t
+      (user-error "No card found at point or card has no ID")))))
 
 (defun org-workbench-sync-all-cards ()
   "Sync all cards in the current workbench with their sources.
-This function requires ID system to be enabled."
+Supports both heading cards (via ID) and file cards (via file path)."
   (interactive)
-  (unless (org-workbench--should-use-id-p)
-    (user-error "ID system is not enabled. Enable org-workbench-enable-id-system and load a supported package (org-supertag, org-brain, or org-roam)"))
-  
   (let* ((current-cards (org-workbench--get-cards))
          (total-cards (length current-cards))
-         (synced-count 0))
+         (synced-count 0)
+         (id-system-enabled (org-workbench--should-use-id-p)))
     (if (zerop total-cards)
         (message "No cards to sync")
       (progn
         (message "Syncing %d cards..." total-cards)
         (dolist (card current-cards)
-          (let* ((id (plist-get card :id))
-                 (updated-card (when id
-                                (save-excursion
-                                  (org-id-goto id)
-                                  (org-workbench--extract-card-info nil)))))
+          (let* ((level (plist-get card :level))
+                 (is-file-card (zerop (or level 1)))
+                 (id (plist-get card :id))
+                 (updated-card nil))
+            ;; Determine sync method based on card type
+            (setq updated-card
+                  (cond
+                   ;; File card - sync from file
+                   (is-file-card
+                    (org-workbench--sync-file-card card))
+                   ;; Heading card - sync via ID (if enabled)
+                   ((and id id-system-enabled)
+                    (save-excursion
+                      (org-id-goto id)
+                      (org-workbench--extract-card-info nil)))
+                   ;; Skip cards without ID when system disabled
+                   (t nil)))
+            ;; Update card if sync successful
             (when updated-card
               (setq current-cards (mapcar (lambda (c)
                                            (if (equal c card) updated-card c))
@@ -804,9 +973,9 @@ This function requires ID system to be enabled."
 ;;------------------------------------------------------------------------------
 
 (define-minor-mode org-workbench-mode
-  "Minor mode for org-workbench."
-  :lighter " Workbench"
-  :keymap org-workbench-mode-map)
+  "Minor mode for org-workbench.
+Users can bind commands to their preferred keys in their configuration."
+  :lighter " Workbench")
 
 ;; Workbench org-mode
 (defvar org-workbench-org-mode-map
